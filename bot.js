@@ -1,3 +1,7 @@
+require('dotenv').config();
+
+const http = require('http');
+
 const { Client, GatewayIntentBits, EmbedBuilder, PermissionsBitField, ActivityType } = require('discord.js');
 
 // ─── CONFIG ────────────────────────────────────────────────────────────────
@@ -23,52 +27,102 @@ const discord = new Client({ intents: [GatewayIntentBits.Guilds] });
 let previousNicknames = new Set();
 let statusMessage = null;
 let lastStatusCount = -1;
+let tsOnline = null;
 
 // ─── TEAMSPEAK ──────────────────────────────────────────────────────────────
 
 async function fetchTSClients() {
-  const url = `${config.TS_API_BASE}/clientlist?ts=${Date.now()}`;
+  const url = new URL(`${config.TS_API_BASE}/clientlist?ts=${Date.now()}`);
 
-  const res = await fetch(url, {
-    headers: {
-      'x-api-key': config.TS_API_KEY,
-      'Cache-Control': 'no-cache',
-      Pragma: 'no-cache',
-    },
-    cache: 'no-store',
-    signal: AbortSignal.timeout(8000),
+  return new Promise((resolve, reject) => {
+    const req = http.request(url, {
+      method: 'POST',
+      headers: {
+        'x-api-key': config.TS_API_KEY,
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+      },
+      timeout: 8000,
+    }, (res) => {
+      let data = '';
+
+      res.on('data', chunk => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`TS API responded ${res.statusCode}`));
+          return;
+        }
+
+        try {
+          const json = JSON.parse(data);
+
+          if (json.status?.code !== 0) {
+            reject(new Error(`TS API error: ${json.status?.message}`));
+            return;
+          }
+
+          resolve(
+            (json.body || []).filter(c => String(c.client_type) === '0')
+          );
+        } catch (err) {
+          reject(new Error(`Invalid TS API response: ${err.message}`));
+        }
+      });
+    });
+
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('TS API request timed out'));
+    });
+
+    req.on('error', reject);
+
+    req.end();
   });
-
-  if (!res.ok) throw new Error(`TS API responded ${res.status}`);
-
-  const json = await res.json();
-  if (json.status?.code !== 0) throw new Error(`TS API error: ${json.status?.message}`);
-
-  return (json.body || []).filter(c => String(c.client_type) === '0');
 }
 
 // ─── DISCORD HELPERS ────────────────────────────────────────────────────────
 
-function buildStatusEmbed(nicknames) {
-  const sorted = [...nicknames].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+function buildStatusEmbed(nicknames, online = true) {
+  const sorted = [...nicknames].sort((a, b) =>
+    a.localeCompare(b, undefined, { sensitivity: 'base' })
+  );
+
   const count = sorted.length;
+
+  if (!online) {
+    const embed = new EmbedBuilder()
+      .setTitle('TeamSpeak Server Status')
+      .setColor(0xe74c3c)
+      .setDescription('🔴 **TeamSpeak 6 server is currently offline.**')
+      .setFooter({ text: 'Server offline' })
+      .setTimestamp();
+
+    return embed;
+  }
 
   const embed = new EmbedBuilder()
     .setTitle('TeamSpeak Server Status')
-    .setColor(count > 0 ? 0x2ecc71 : 0x95a5a6)
+    .setColor(0x2ecc71)
     .setFooter({ text: `${count} user${count !== 1 ? 's' : ''} online` })
     .setTimestamp();
 
-    if (config.TS_INVITE_URL) {
-      const params = [
-        config.TS_SERVER_PASSWORD ? `password=${config.TS_SERVER_PASSWORD}` : '',
-        config.TS_CHANNEL_ID ? `cid=${config.TS_CHANNEL_ID}` : '',
-        config.TS_CHANNEL_PASSWORD ? `channelpassword=${config.TS_CHANNEL_PASSWORD}` : '',
-      ].filter(Boolean).join('&');
-    
-      const url = params ? `${config.TS_INVITE_URL}?${params}` : config.TS_INVITE_URL;
-      embed.setDescription(`[Click here to join](${url})`);
-    }
+  if (config.TS_INVITE_URL) {
+    const params = [
+      config.TS_SERVER_PASSWORD ? `password=${config.TS_SERVER_PASSWORD}` : '',
+      config.TS_CHANNEL_ID ? `cid=${config.TS_CHANNEL_ID}` : '',
+      config.TS_CHANNEL_PASSWORD ? `channelpassword=${config.TS_CHANNEL_PASSWORD}` : '',
+    ].filter(Boolean).join('&');
+
+    const url = params
+      ? `${config.TS_INVITE_URL}?${params}`
+      : config.TS_INVITE_URL;
+
+    embed.setDescription(`[Click here to join](${url})`);
+  }
 
   embed.addFields({
     name: 'Users Online',
@@ -132,25 +186,43 @@ async function purgeChannel(channel) {
   }
 }
 
-async function initStatusMessage(channel, nicknames) {
-  await purgeChannel(channel);
+async function initStatusMessage(channel, nicknames, online = true) {
   await lockChannel(channel);
 
-  const embed = buildStatusEmbed(nicknames);
-  statusMessage = await channel.send({ embeds: [embed] });
-  console.log('[Discord] Status message created');
+  const embed = buildStatusEmbed(nicknames, online);
+
+  try {
+    const messages = await channel.messages.fetch({ limit: 50 });
+
+    const existing = messages.find(
+      m => m.author.id === discord.user.id && m.embeds.length > 0
+    );
+
+    if (existing) {
+      statusMessage = existing;
+      await statusMessage.edit({ embeds: [embed] });
+      console.log('[Discord] Existing status message updated');
+    } else {
+      statusMessage = await channel.send({ embeds: [embed] });
+      console.log('[Discord] Status message created');
+    }
+  } catch (err) {
+    console.error('[Discord] Failed to initialize status message:', err.message);
+  }
 }
 
-async function updateStatusMessage(nicknames) {
+async function updateStatusMessage(nicknames, online = true) {
   try {
-    const embed = buildStatusEmbed(nicknames);
+    const embed = buildStatusEmbed(nicknames, online);
 
     if (!statusMessage) {
       const channel = await discord.channels.fetch(config.STATUS_CHANNEL_ID);
       if (!channel) return;
 
       const messages = await channel.messages.fetch({ limit: 10 });
-      const existing = messages.find(m => m.author.id === discord.user.id && m.embeds.length > 0);
+      const existing = messages.find(
+        m => m.author.id === discord.user.id && m.embeds.length > 0
+      );
 
       if (existing) {
         statusMessage = existing;
@@ -174,23 +246,51 @@ async function poll() {
     const clients = await fetchTSClients();
     const currentNicknames = new Set(clients.map(c => c.client_nickname));
 
-    const changed = currentNicknames.size !== previousNicknames.size ||
+    const changed =
+      tsOnline !== true ||
+      currentNicknames.size !== previousNicknames.size ||
       [...currentNicknames].some(n => !previousNicknames.has(n));
 
     if (changed) {
-      const joined = [...currentNicknames].filter(n => !previousNicknames.has(n));
-      const left   = [...previousNicknames].filter(n => !currentNicknames.has(n));
+      const joined = [...currentNicknames].filter(
+        n => !previousNicknames.has(n)
+      );
+
+      const left = [...previousNicknames].filter(
+        n => !currentNicknames.has(n)
+      );
+
       joined.forEach(n => console.log(`[TS6] JOIN: ${n}`));
       left.forEach(n => console.log(`[TS6] LEAVE: ${n}`));
 
-      await updateStatusMessage(currentNicknames);
+      await updateStatusMessage(currentNicknames, true);
       updateBotActivity(currentNicknames.size);
+
+      if (tsOnline !== true) {
+        console.log('[TS6] Server is ONLINE');
+      }
     }
 
     previousNicknames = currentNicknames;
+    tsOnline = true;
 
   } catch (err) {
     console.error('[Poll] Error:', err.message);
+
+    if (tsOnline !== false) {
+      console.log('[TS6] Server is OFFLINE');
+
+      previousNicknames = new Set();
+      tsOnline = false;
+
+      await updateStatusMessage(new Set(), false);
+
+      discord.user.setActivity('TeamSpeak — offline', {
+        type: ActivityType.Watching
+      });
+
+      lastStatusCount = -1;
+    }
   }
 }
 
@@ -200,19 +300,44 @@ discord.once('clientReady', async () => {
   console.log(`[Discord] Logged in as ${discord.user.tag}`);
   console.log(`[Config] Polling TS6 at ${config.TS_API_BASE} every ${config.POLL_INTERVAL / 1000}s`);
 
-  try {
+    try {
     const clients = await fetchTSClients();
     const currentNicknames = new Set(clients.map(c => c.client_nickname));
+
     previousNicknames = currentNicknames;
+    tsOnline = true;
 
     console.log(`[TS6] Bot started. ${currentNicknames.size} user(s) currently online:`);
     currentNicknames.forEach(n => console.log(`  - ${n}`));
 
     const channel = await discord.channels.fetch(config.STATUS_CHANNEL_ID);
-    if (channel) await initStatusMessage(channel, currentNicknames);
+
+    if (channel) {
+      await initStatusMessage(channel, currentNicknames);
+    }
+
     updateBotActivity(currentNicknames.size);
+
   } catch (err) {
-    console.error('[Startup] Failed initial setup:', err.message);
+    console.error('[Startup] TS6 server is offline:', err.message);
+
+    previousNicknames = new Set();
+    tsOnline = false;
+
+    try {
+      const channel = await discord.channels.fetch(config.STATUS_CHANNEL_ID);
+
+      if (channel) {
+  await initStatusMessage(channel, new Set(), false);
+}
+
+      discord.user.setActivity('TeamSpeak — offline', {
+        type: ActivityType.Watching
+      });
+
+    } catch (discordErr) {
+      console.error('[Startup] Failed to create offline status:', discordErr.message);
+    }
   }
 
   setInterval(poll, config.POLL_INTERVAL);
